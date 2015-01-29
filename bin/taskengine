@@ -1,0 +1,167 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+use Edgewater::Taskmanager;
+use Time::HiRes qw (setitimer ITIMER_REAL time );
+use Sys::Sig;
+use POSIX ":sys_wait_h";
+use POSIX qw(setsid);
+
+my $taskfile = "/ewn/var/taskengine.lock";
+my $mydebug=shift @ARGV || 0;
+if(! $mydebug) # Lazy way to turn off "daemon-ness" for debugging...
+{
+chdir '/'                 or die "Can't chdir to /: $!";
+umask 0;
+open STDIN, '/dev/null'   or die "Can't read /dev/null: $!";
+open STDOUT, '>/dev/null' or die "Can't write to /dev/null: $!";
+#open STDOUT, '>>/work/logs/taskengine.log' or die "Can't write to /dev/null: $!";
+open STDERR, '>/dev/null' or die "Can't write to /dev/null: $!";
+defined(my $pid = fork)   or die "Can't fork: $!";
+if($pid) {
+open EVTASK, ">$taskfile";
+print EVTASK "$pid\n";
+close EVTASK;
+
+exit;
+}
+setsid                    or die "Can't start a new session: $!";
+}
+
+sub Debug($) {
+  my $arg = shift;
+  open (X,">>/tmp/debug.out");
+  my $date = `date`;
+  chomp($date);
+  print X "[".$date."]: ".$arg."\n";
+  close X;
+}
+
+
+
+print "\ntaskengine Starting.\n";
+
+
+my $cnt=0;
+# Loop forever getting new tasks
+while ( 1 ) {
+
+  my $newtask = Edgewater::Taskmanager::GetNextTask();
+
+  # Polling to find a new task. Check once a second or so. 
+  if ($newtask == 0) {
+    #print "no task found, sleeping..." . `date` ."\n";
+    sleep 1;
+    next;
+  }
+
+  # Cleanup every once in awhile
+  if ($cnt > 10000) {
+      # Note: This operation only removes rows more than 7 days old. The 
+      # cnt number is only here to avoid calling it too often.
+      Edgewater::Taskmanager::CleanupOldTasks();
+      $cnt=0;
+  }
+  $cnt++;
+
+
+  my $pid;
+  my $timedout=0;
+  
+  $SIG{ALRM} = sub { kill Sys::Sig->TERM,$pid; $timedout=1; };
+
+  #print "Executing $newtask->{COMMAND} $newtask->{ARGUMENTS} with priority=$newtask->{PRIORITY} ... \n";
+
+### I don't think I really need this at this time. DCG. 4/19/09
+###  if ($newtask->{NOSPAWN}) {
+###    $newtask->SetStatus("STARTED");
+###    my $cmd = "$newtask->{COMMAND} $newtask->{TASKID} $newtask->{ARGUMENTS}";
+###    my $retcode = system($cmd);
+###
+###    if ($retcode == 0) {
+###      $newtask->SetStatus("EXECUTED");
+###      $newtask->SetUpdateTableExecutedStatus(); 
+###    }
+###    else {
+###      $newtask->SetStatus("FAILURE:$retcode");
+###      $newtask->SetUpdateTableErrorStatus();
+###      $newtask->SetUpdateTableComment("Non-zero exit code: $retcode returned when trying to execute TASKID=$newtask->{TASKID}, in tasks table with COMMAND=$newtask->{COMMAND}, ARGUMENTS=$newtask->{ARGUMENTS}\n");
+###    }
+###
+###    exit $retcode;
+###
+###  }
+###
+
+
+
+  # Timer set in case we are unable to spawn the task.
+  if (defined $newtask->{TIMEOUT}) {
+    setitimer(ITIMER_REAL, $newtask->{TIMEOUT}, 0.0);
+  }
+
+
+  if ($pid = fork) {
+    #parent
+
+    # Wait for my exec to finish. It should normally be very fast.
+    # It if takes more than the timeout value, then we'll get a non-zero
+    # status return since the timeout will have killed the process.
+    #print "Waiting for pid=$pid\n";
+    waitpid($pid,0);
+
+    my $exitcode = ($? >> 8);
+
+    if ($timedout > 0) {
+      # Error condition, probably timed out
+
+      #print "TIMED OUT!\n";
+      $newtask->SetStatus("TIMEOUT");
+      $newtask->SetUpdateTableTimeoutStatus(); 
+      $newtask->SetUpdateTableComment("Timed Out trying to exec TASKID=$newtask->{TASKID}, in tasks table with COMMAND=$newtask->{COMMAND}, ARGUMENTS=$newtask->{ARGUMENTS}\n");
+
+    }
+    elsif ($exitcode != 0) {
+
+      if (defined $newtask->{TIMEOUT}) {
+	setitimer(ITIMER_REAL, 0.0, 0.0);
+      }
+
+      # It could not exec the process or the process returned
+      # a non-zero
+      #print "FAILURE with exit code: $exitcode\n";
+      $newtask->SetStatus("FAILURE:$exitcode");
+      $newtask->SetUpdateTableErrorStatus();
+      $newtask->SetUpdateTableComment("Non-zero exit code: $exitcode returned when trying to execute TASKID=$newtask->{TASKID}, in tasks table with COMMAND=$newtask->{COMMAND}, ARGUMENTS=$newtask->{ARGUMENTS}\n");
+
+    }
+    else {
+      # Cancel the timer
+      if (defined $newtask->{TIMEOUT}) {
+	setitimer(ITIMER_REAL, 0.0, 0.0);
+      }
+    }
+
+  }
+  else {
+    # child
+    $newtask->SetStatus("STARTED");
+    my $cmd = "$newtask->{COMMAND} $newtask->{TASKID} $newtask->{ARGUMENTS}";
+    my $retcode = system($cmd);
+    
+    if ($retcode == 0) {
+    }
+    else {
+      $newtask->SetStatus("FAILURE:$retcode");
+      $newtask->SetUpdateTableErrorStatus();
+      $newtask->SetUpdateTableComment("Non-zero exit code: $retcode returned when trying to execute TASKID=$newtask->{TASKID}, in tasks table with COMMAND=$newtask->{COMMAND}, ARGUMENTS=$newtask->{ARGUMENTS}\n");
+    }
+
+    exit $retcode;
+  }
+
+}
+
+exit(0);
+
